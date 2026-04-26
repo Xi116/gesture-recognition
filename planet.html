@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gesture Planet</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: sans-serif; }
+    canvas#three-canvas {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1;
+    }
+    /* MediaPipe video + canvas overlay */
+    #cam-container {
+      position: fixed; bottom: 16px; right: 16px;
+      width: 220px; height: 165px;
+      border: 1.5px solid rgba(255,160,50,0.5);
+      border-radius: 10px; overflow: hidden; z-index: 10;
+    }
+    #input-video {
+      width: 100%; height: 100%; object-fit: cover;
+      transform: scaleX(-1);
+    }
+    #hand-canvas {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%;
+      transform: scaleX(-1);
+    }
+    #ui-overlay {
+      position: fixed; top: 16px; left: 16px;
+      color: rgba(255,200,100,0.85); font-size: 13px; z-index: 20;
+      pointer-events: none; line-height: 1.8;
+    }
+    #gesture-info {
+      position: fixed; top: 16px; right: 16px;
+      color: rgba(255,200,100,0.9); font-size: 14px;
+      z-index: 20; pointer-events: none;
+      background: rgba(0,0,0,0.4); padding: 6px 12px; border-radius: 8px;
+    }
+    #loading {
+      position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%,-50%);
+      color: rgba(255,160,50,0.9); font-size: 18px; z-index: 30;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="three-canvas"></canvas>
+
+  <div id="cam-container">
+    <video id="input-video" autoplay muted playsinline></video>
+    <canvas id="hand-canvas"></canvas>
+  </div>
+
+  <div id="ui-overlay">
+    ✋ 旋转手掌 → 星球旋转<br>
+    ✊ 握拳 + 向后拉 → 镜头远离<br>
+    🖐 张开 + 向前推 → 镜头靠近
+  </div>
+  <div id="gesture-info">识别中…</div>
+  <div id="loading">⏳ 正在初始化…</div>
+
+  <!-- Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <!-- MediaPipe Hands (CDN, 全局变量方式) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+  // ─────────────────────────────────────────────
+  //  THREE.JS  ─  Planet + Rings
+  // ─────────────────────────────────────────────
+  const canvas3 = document.getElementById('three-canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas: canvas3, antialias: true, alpha: false });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000005);
+
+  const scene = new THREE.Scene();
+
+  // Camera
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+  let camRadius = 280;        // initial distance from planet centre
+  const CAM_MIN = 90;         // closest allowed
+  const CAM_MAX = 1200;
+  let camTheta = 0;           // horizontal angle
+  let camPhi   = Math.PI / 6; // vertical angle (small tilt)
+
+  function updateCamera() {
+    camera.position.set(
+      camRadius * Math.sin(camTheta) * Math.cos(camPhi),
+      camRadius * Math.sin(camPhi),
+      camRadius * Math.cos(camTheta) * Math.cos(camPhi)
+    );
+    camera.lookAt(0, 0, 0);
+  }
+  updateCamera();
+
+  // ── Planet core particles ──────────────────────
+  const PLANET_R      = 80;
+  const CORE_COUNT    = 28000;   // sphere volume
+  const SURFACE_COUNT = 18000;   // surface concentration
+
+  function randGaussian(mean, std) {
+    // Box-Muller
+    const u = 1 - Math.random();
+    const v = Math.random();
+    return mean + std * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  // Build planet geometry
+  function buildPlanet() {
+    const positions = [];
+    const colors    = [];
+
+    // 1. Volume particles
+    for (let i = 0; i < CORE_COUNT; i++) {
+      // uniform sphere
+      const u = Math.random(); const v = Math.random(); const w = Math.random();
+      const r = PLANET_R * Math.cbrt(u) * 0.98;
+      const theta = Math.acos(2 * v - 1);
+      const phi   = 2 * Math.PI * w;
+      positions.push(
+        r * Math.sin(theta) * Math.cos(phi),
+        r * Math.sin(theta) * Math.sin(phi),
+        r * Math.cos(theta)
+      );
+      // Orange gradient: core is brighter / redder, outer dimmer
+      const t = r / PLANET_R;
+      colors.push(1.0, 0.45 + 0.15 * (1 - t), 0.05 * (1 - t));
+    }
+
+    // 2. Surface-concentrated particles
+    for (let i = 0; i < SURFACE_COUNT; i++) {
+      const r = PLANET_R + randGaussian(0, 2.5);
+      const theta = Math.acos(2 * Math.random() - 1);
+      const phi   = 2 * Math.PI * Math.random();
+      positions.push(
+        r * Math.sin(theta) * Math.cos(phi),
+        r * Math.sin(theta) * Math.sin(phi),
+        r * Math.cos(theta)
+      );
+      colors.push(1.0, 0.6 + Math.random() * 0.3, 0.0);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('color',    new THREE.Float32BufferAttribute(colors, 3));
+
+    const mat = new THREE.PointsMaterial({
+      size: 1.6,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.92,
+      sizeAttenuation: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    return new THREE.Points(geo, mat);
+  }
+
+  const planet = buildPlanet();
+  scene.add(planet);
+
+  // ── Glow halo ──────────────────────────────────
+  function buildGlow() {
+    const geo = new THREE.SphereGeometry(PLANET_R * 1.15, 32, 32);
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xff6600,
+      transparent: true,
+      opacity: 0.06,
+      side: THREE.BackSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    return new THREE.Mesh(geo, mat);
+  }
+  scene.add(buildGlow());
+
+  // ── Rings ──────────────────────────────────────
+  function buildRing(innerR, outerR, count, tilt) {
+    const positions = [];
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const r = innerR + Math.random() * (outerR - innerR);
+      // slight vertical scatter
+      const y = (Math.random() - 0.5) * 3;
+      positions.push(Math.cos(angle) * r, y, Math.sin(angle) * r);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+
+    const mat = new THREE.PointsMaterial({
+      size: 2.4,
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.85,
+      sizeAttenuation: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const pts = new THREE.Points(geo, mat);
+    pts.rotation.x = tilt;
+    return pts;
+  }
+
+  const ring1 = buildRing(115, 145, 14000, Math.PI * 0.08);
+  const ring2 = buildRing(162, 200, 12000, Math.PI * 0.13);
+  scene.add(ring1, ring2);
+
+  // ── Starfield background ───────────────────────
+  function buildStars() {
+    const pos = [];
+    for (let i = 0; i < 6000; i++) {
+      const r = 1200 + Math.random() * 800;
+      const theta = Math.acos(2 * Math.random() - 1);
+      const phi   = 2 * Math.PI * Math.random();
+      pos.push(r * Math.sin(theta) * Math.cos(phi), r * Math.sin(theta) * Math.sin(phi), r * Math.cos(theta));
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({ size: 1.2, color: 0xffffff, sizeAttenuation: true });
+    return new THREE.Points(geo, mat);
+  }
+  scene.add(buildStars());
+
+  // ─────────────────────────────────────────────
+  //  MEDIAPIPE HANDS
+  // ─────────────────────────────────────────────
+  const videoEl  = document.getElementById('input-video');
+  const handCvs  = document.getElementById('hand-canvas');
+  const handCtx  = handCvs.getContext('2d');
+  const gestInfo = document.getElementById('gesture-info');
+  const loadingEl= document.getElementById('loading');
+
+  // ── State ──────────────────────────────────────
+  const state = {
+    gesture: 'none',         // 'rotate' | 'zoom_in' | 'zoom_out' | 'none'
+    // rotation tracking
+    prevWristX: null,
+    prevWristY: null,
+    // zoom tracking
+    prevPalmY: null,
+    prevPalmZ: null,        // palm depth proxy (palm size)
+    zoomVelocity: 0,
+    rotateVX: 0,
+    rotateVY: 0,
+  };
+
+  // ── Gesture classification ─────────────────────
+  // 使用 TIP vs PIP 的 y 坐标差值（MediaPipe y向下）：
+  //   tip.y > pip.y → 手指弯曲（curl）
+  //   tip.y < pip.y → 手指伸直（extend）
+  function fingerCurl(tip, pip) {
+    // 返回 curl 程度：正数越大越弯曲
+    return tip.y - pip.y;
+  }
+
+  function classifyHand(lm) {
+    // pip joints: index=6, middle=10, ring=14, pinky=18
+    // tip joints: index=8, middle=12, ring=16, pinky=20
+    const pips = [lm[6],  lm[10], lm[14], lm[18]];
+    const tips = [lm[8],  lm[12], lm[16], lm[20]];
+
+    // 计算4根手指各自的curl值，curl>0表示弯曲
+    const curls = tips.map((t, i) => fingerCurl(t, pips[i]));
+    const avgCurl = curls.reduce((a, b) => a + b, 0) / 4;
+
+    // 拇指：用 tip(4) vs ip(3) 的 x 差（拇指横向展开）
+    const thumbOpen = Math.abs(lm[4].x - lm[3].x) > 0.04;
+
+    // 握拳：平均curl明显正（手指弯曲）
+    const isFist = avgCurl > 0.02;
+
+    // 张开：平均curl为负（手指伸直）且拇指张开
+    const isOpen = avgCurl < -0.015 && thumbOpen;
+
+    // 用于debug
+    const wrist = lm[0];
+    const tips4 = tips;
+    const mcp   = [lm[5], lm[9], lm[13], lm[17]];
+    let tipDist = 0, mcpDist = 0;
+    for (let i = 0; i < 4; i++) {
+      const dx = tips4[i].x - wrist.x, dy = tips4[i].y - wrist.y;
+      tipDist += Math.sqrt(dx*dx + dy*dy);
+      const dx2 = mcp[i].x - wrist.x, dy2 = mcp[i].y - wrist.y;
+      mcpDist += Math.sqrt(dx2*dx2 + dy2*dy2);
+    }
+    tipDist /= 4; mcpDist /= 4;
+
+    return { isFist, isOpen, tipDist, mcpDist, avgCurl };
+  }
+
+  // Palm size (rough scale for Z depth)
+  function palmSize(lm) {
+    const dx = lm[5].x - lm[17].x;
+    const dy = lm[5].y - lm[17].y;
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  // Wrist position (normalized)
+  function wristPos(lm) {
+    return { x: lm[0].x, y: lm[0].y };
+  }
+
+  // ── MediaPipe init ─────────────────────────────
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.55,
+    minTrackingConfidence: 0.5
+  });
+
+  hands.onResults((results) => {
+    // Draw on mini overlay
+    handCtx.clearRect(0, 0, handCvs.width, handCvs.height);
+    if (results.image) {
+      handCtx.drawImage(results.image, 0, 0, handCvs.width, handCvs.height);
+    }
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      const lm = results.multiHandLandmarks[0];
+      drawConnectors(handCtx, lm, HAND_CONNECTIONS, { color: 'rgba(255,180,50,0.7)', lineWidth: 1.5 });
+      drawLandmarks(handCtx, lm, { color: '#ff8c00', lineWidth: 1, radius: 2 });
+
+      const { isFist, isOpen } = classifyHand(lm);
+      const wp = wristPos(lm);
+      const ps = palmSize(lm);
+
+      if (isFist) {
+        // ── Zoom out (fist) ──
+        gestInfo.textContent = '✊ 握拳 – 远离星球';
+        state.gesture = 'zoom_out';
+        if (state.prevPalmZ !== null) {
+          const dz = state.prevPalmZ - ps;
+          const speed = dz * 1400;
+          state.zoomVelocity = speed;
+        }
+        state.prevPalmZ = ps;
+        state.prevWristX = null;
+      } else if (isOpen) {
+        // ── Zoom in (open) ──
+        gestInfo.textContent = '🖐 张开 – 靠近星球';
+        state.gesture = 'zoom_in';
+        if (state.prevPalmZ !== null) {
+          const dz = ps - state.prevPalmZ;
+          const speed = dz * 1000;
+          state.zoomVelocity = -speed;
+        }
+        state.prevPalmZ = ps;
+        state.prevWristX = null;
+      } else {
+        // ── Rotate (neutral / tilt) ──
+        gestInfo.textContent = '✋ 旋转手势';
+        state.gesture = 'rotate';
+        if (state.prevWristX !== null) {
+          const dx = wp.x - state.prevWristX;
+          const dy = wp.y - state.prevWristY;
+          // 提高系数，更灵敏
+          state.rotateVX += dx * 8.0;
+          state.rotateVY += dy * 4.0;
+        }
+        state.prevWristX = wp.x;
+        state.prevWristY = wp.y;
+        state.prevPalmZ  = ps;
+      }
+    } else {
+      gestInfo.textContent = '识别中…';
+      state.gesture = 'none';
+      state.prevWristX = null;
+      state.prevPalmZ  = null;
+    }
+  });
+
+  // ── Camera utils ───────────────────────────────
+  const mpCamera = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width: 640, height: 480
+  });
+
+  mpCamera.start().then(() => {
+    loadingEl.style.display = 'none';
+    // Sync canvas size
+    handCvs.width  = videoEl.videoWidth  || 640;
+    handCvs.height = videoEl.videoHeight || 480;
+  }).catch(e => {
+    loadingEl.textContent = '⚠️ 摄像头权限被拒绝，手势功能不可用';
+    console.warn(e);
+  });
+
+  // ─────────────────────────────────────────────
+  //  ANIMATION LOOP
+  // ─────────────────────────────────────────────
+  const clock = new THREE.Clock();
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  // Easing helpers
+  function easeIn(t)  { return t * t; }
+  function easeOut(t) { return t * (2 - t); }
+
+  let prevCamRadius = camRadius;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+
+    // ── Auto slow rotation ──
+    camTheta += 0.0008;
+
+    // ── Gesture-driven camera ──
+    if (state.gesture === 'rotate') {
+      camTheta -= state.rotateVX * dt;
+      camPhi    = clamp(camPhi + state.rotateVY * dt, -Math.PI * 0.45, Math.PI * 0.45);
+      state.rotateVX *= 0.82;
+      state.rotateVY *= 0.82;
+    } else {
+      state.rotateVX *= 0.9;
+      state.rotateVY *= 0.9;
+    }
+
+    if (state.gesture === 'zoom_out') {
+      // Speed: ease-in (slow then fast)
+      const delta = Math.abs(state.zoomVelocity);
+      const sign  = state.zoomVelocity > 0 ? 1 : -1;
+      const t = clamp((camRadius - CAM_MIN) / (CAM_MAX - CAM_MIN), 0, 1);
+      const speedFactor = easeIn(t) * 5 + 0.5;
+      camRadius += sign * delta * speedFactor * dt * 60;
+      state.zoomVelocity *= 0.85;
+    } else if (state.gesture === 'zoom_in') {
+      const delta = Math.abs(state.zoomVelocity);
+      const sign  = state.zoomVelocity > 0 ? 1 : -1;
+      const t = clamp(1 - (camRadius - CAM_MIN) / (CAM_MAX - CAM_MIN), 0, 1);
+      const speedFactor = easeOut(t) * 5 + 0.5;
+      camRadius += sign * delta * speedFactor * dt * 60;
+      state.zoomVelocity *= 0.85;
+    } else {
+      state.zoomVelocity *= 0.75;
+    }
+
+    camRadius = clamp(camRadius, CAM_MIN, CAM_MAX);
+    updateCamera();
+
+    // ── Planet slow spin ──
+    planet.rotation.y += 0.0015;
+    ring1.rotation.y  -= 0.0009;
+    ring2.rotation.y  += 0.0006;
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ── Resize ────────────────────────────────────
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  </script>
+</body>
+</html>

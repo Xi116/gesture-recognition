@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>指尖写字</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#07080f; overflow:hidden; font-family:'Segoe UI',sans-serif; }
+
+    /* 主写字画布（全屏） */
+    #draw-canvas {
+      position:fixed; top:0; left:0; width:100%; height:100%; z-index:1;
+    }
+
+    /* 摄像头小窗 */
+    #cam-wrap {
+      position:fixed; bottom:20px; right:20px;
+      width:240px; height:180px; z-index:10;
+      border-radius:12px; overflow:hidden;
+      border:1.5px solid rgba(100,200,255,0.3);
+      box-shadow:0 0 18px rgba(60,140,255,0.15);
+    }
+    #input-video {
+      width:100%; height:100%; object-fit:cover;
+      transform:scaleX(-1);
+    }
+    #hand-overlay {
+      position:absolute; top:0; left:0; width:100%; height:100%;
+      transform:scaleX(-1);
+    }
+
+    /* 顶部信息栏 */
+    #topbar {
+      position:fixed; top:0; left:0; right:0;
+      display:flex; align-items:center; justify-content:space-between;
+      padding:10px 20px;
+      background:linear-gradient(to bottom,rgba(7,8,15,0.9),transparent);
+      z-index:20; pointer-events:none;
+    }
+    #topbar h1 {
+      font-size:16px; font-weight:600;
+      color:rgba(140,210,255,0.9);
+    }
+    #status {
+      font-size:13px;
+      color:rgba(140,210,255,0.75);
+      background:rgba(10,20,50,0.55);
+      padding:5px 12px; border-radius:20px;
+      border:1px solid rgba(80,160,255,0.2);
+    }
+
+    /* 底部工具栏 */
+    #toolbar {
+      position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+      display:flex; gap:10px; z-index:20;
+    }
+    .btn {
+      padding:8px 18px; border-radius:30px; border:none; cursor:pointer;
+      font-size:13px; font-weight:600; letter-spacing:.5px;
+      transition:all .2s;
+    }
+    #btn-clear {
+      background:rgba(255,80,80,0.18);
+      color:rgba(255,160,160,0.95);
+      border:1px solid rgba(255,80,80,0.35);
+    }
+    #btn-clear:hover { background:rgba(255,80,80,0.32); }
+
+    #btn-color {
+      background:rgba(80,160,255,0.18);
+      color:rgba(160,210,255,0.95);
+      border:1px solid rgba(80,160,255,0.35);
+    }
+    #btn-color:hover { background:rgba(80,160,255,0.32); }
+
+    #btn-size {
+      background:rgba(100,255,180,0.15);
+      color:rgba(140,255,200,0.95);
+      border:1px solid rgba(100,255,180,0.3);
+    }
+    #btn-size:hover { background:rgba(100,255,180,0.28); }
+
+    /* 颜色选择弹出 */
+    #color-picker {
+      position:fixed; bottom:70px; left:50%; transform:translateX(-50%);
+      display:none; gap:8px; z-index:25;
+    }
+    #color-picker.show { display:flex; }
+    .color-dot {
+      width:28px; height:28px; border-radius:50%; cursor:pointer;
+      border:2px solid rgba(255,255,255,0.2);
+      transition:transform .15s, border-color .15s;
+    }
+    .color-dot:hover, .color-dot.active {
+      transform:scale(1.25); border-color:rgba(255,255,255,0.8);
+    }
+
+    /* 手势提示 */
+    #hint {
+      position:fixed; top:50px; left:20px;
+      color:rgba(120,190,255,0.6); font-size:12px;
+      z-index:20; pointer-events:none; line-height:2;
+    }
+
+    #loading {
+      position:fixed; top:50%; left:50%;
+      transform:translate(-50%,-50%);
+      color:rgba(120,200,255,0.9); font-size:16px; z-index:30;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="draw-canvas"></canvas>
+
+  <div id="cam-wrap">
+    <video id="input-video" autoplay muted playsinline></video>
+    <canvas id="hand-overlay"></canvas>
+  </div>
+
+  <div id="topbar">
+    <h1>✍️ 指尖写字</h1>
+    <div id="status">等待检测…</div>
+  </div>
+
+  <div id="hint">
+    ☝️ 伸出食指 → 开始书写<br>
+    ✊ 握拳 → 暂停（抬笔）<br>
+    🤟 竖起食指+中指 → 暂停
+  </div>
+
+  <div id="color-picker">
+    <div class="color-dot active" style="background:#7ef0ff" data-color="#7ef0ff"></div>
+    <div class="color-dot" style="background:#ff8c42" data-color="#ff8c42"></div>
+    <div class="color-dot" style="background:#b8ff6e" data-color="#b8ff6e"></div>
+    <div class="color-dot" style="background:#ff6eb4" data-color="#ff6eb4"></div>
+    <div class="color-dot" style="background:#ffe94e" data-color="#ffe94e"></div>
+    <div class="color-dot" style="background:#ffffff" data-color="#ffffff"></div>
+    <div class="color-dot" style="background:#cc88ff" data-color="#cc88ff"></div>
+  </div>
+
+  <div id="toolbar">
+    <button class="btn" id="btn-color">🎨 颜色</button>
+    <button class="btn" id="btn-size">🖊 粗细</button>
+    <button class="btn" id="btn-clear">🗑 清除</button>
+  </div>
+
+  <div id="loading">⏳ 加载模型…</div>
+
+  <!-- MediaPipe Hands (CDN 全局变量) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+  // ════════════════════════════════════════════════
+  //  DRAW CANVAS SETUP
+  // ════════════════════════════════════════════════
+  const drawCanvas = document.getElementById('draw-canvas');
+  const ctx = drawCanvas.getContext('2d');
+
+  function resizeCanvas() {
+    // 保留绘制内容：先截图，resize后贴回
+    const imgData = ctx.getImageData(0, 0, drawCanvas.width, drawCanvas.height);
+    drawCanvas.width  = window.innerWidth;
+    drawCanvas.height = window.innerHeight;
+    ctx.putImageData(imgData, 0, 0);
+  }
+  drawCanvas.width  = window.innerWidth;
+  drawCanvas.height = window.innerHeight;
+  window.addEventListener('resize', resizeCanvas);
+
+  // 背景
+  ctx.fillStyle = '#07080f';
+  ctx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
+
+  // ════════════════════════════════════════════════
+  //  PEN STATE
+  // ════════════════════════════════════════════════
+  let penColor    = '#7ef0ff';
+  let penSizes    = [4, 7, 11, 16];
+  let penSizeIdx  = 1;
+  let penSize     = penSizes[penSizeIdx];
+
+  let isDrawing   = false;      // 当前帧是否落笔
+  let prevX       = null;
+  let prevY       = null;
+
+  // 笔迹点轨迹缓冲（用于绘制平滑曲线）
+  const trail = [];             // [{x,y}]
+  const TRAIL_MAX = 8;
+
+  // ── 绘制一段平滑笔迹 ─────────────────────────────
+  function drawStroke(x, y) {
+    if (prevX === null) { prevX = x; prevY = y; return; }
+
+    trail.push({ x, y });
+    if (trail.length > TRAIL_MAX) trail.shift();
+
+    ctx.lineCap    = 'round';
+    ctx.lineJoin   = 'round';
+    ctx.lineWidth  = penSize;
+    ctx.strokeStyle = penColor;
+    ctx.shadowColor = penColor;
+    ctx.shadowBlur  = penSize * 2.5;
+
+    if (trail.length < 3) {
+      ctx.beginPath();
+      ctx.moveTo(prevX, prevY);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    } else {
+      // Catmull-Rom → Bezier 平滑
+      const p0 = trail[trail.length - 3];
+      const p1 = trail[trail.length - 2];
+      const p2 = trail[trail.length - 1];
+      const cpX = p1.x;
+      const cpY = p1.y;
+
+      ctx.beginPath();
+      ctx.moveTo(prevX, prevY);
+      ctx.quadraticCurveTo(cpX, cpY, (p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+      ctx.stroke();
+    }
+
+    prevX = x; prevY = y;
+  }
+
+  function liftPen() {
+    isDrawing = false;
+    prevX = null; prevY = null;
+    trail.length = 0;
+    ctx.shadowBlur = 0;
+  }
+
+  // ── 落笔动画（小圆点） ────────────────────────────
+  function drawDot(x, y) {
+    ctx.beginPath();
+    ctx.arc(x, y, penSize / 2, 0, Math.PI * 2);
+    ctx.fillStyle = penColor;
+    ctx.shadowColor = penColor;
+    ctx.shadowBlur = penSize * 3;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // ════════════════════════════════════════════════
+  //  GESTURE CLASSIFICATION
+  // ════════════════════════════════════════════════
+  // 判断某手指是否伸直：tip.y < pip.y（MediaPipe y向下，tip在pip上方为伸直）
+  function isFingerExtended(tip, pip) {
+    return tip.y < pip.y - 0.02;
+  }
+
+  // 判断手势
+  // 返回: 'write'(只伸食指) | 'pause'(握拳/食指+中指竖起) | 'other'
+  function classifyGesture(lm) {
+    const indexExtended  = isFingerExtended(lm[8],  lm[6]);
+    const middleExtended = isFingerExtended(lm[12], lm[10]);
+    const ringExtended   = isFingerExtended(lm[16], lm[14]);
+    const pinkyExtended  = isFingerExtended(lm[20], lm[18]);
+
+    // 只伸食指 → 写字
+    if (indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+      return 'write';
+    }
+    // 食指+中指均伸直 → 暂停
+    if (indexExtended && middleExtended && !ringExtended && !pinkyExtended) {
+      return 'pause';
+    }
+    // 全部弯曲（握拳） → 暂停
+    if (!indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+      return 'pause';
+    }
+    return 'other';
+  }
+
+  // ════════════════════════════════════════════════
+  //  CURSOR EFFECT  （指尖光晕跟随）
+  // ════════════════════════════════════════════════
+  let cursorX = -100, cursorY = -100;
+  let cursorVisible = false;
+
+  function drawCursor(x, y, active) {
+    // 擦除上一帧光标（用背景色遮盖小范围 — 不可行因为有笔迹，改为overlay层）
+    // 光标画在单独层：这里直接在draw-canvas上画，下一帧会被笔迹压盖
+    // 实际做法：光标用CSS div跟随
+  }
+
+  // 改用CSS div做光标
+  const cursorDiv = document.createElement('div');
+  Object.assign(cursorDiv.style, {
+    position: 'fixed',
+    width: '22px', height: '22px',
+    borderRadius: '50%',
+    border: '2px solid ' + penColor,
+    boxShadow: `0 0 10px ${penColor}, 0 0 20px ${penColor}`,
+    transform: 'translate(-50%,-50%)',
+    pointerEvents: 'none',
+    zIndex: '15',
+    transition: 'opacity .1s',
+    opacity: '0'
+  });
+  document.body.appendChild(cursorDiv);
+
+  function updateCursor(x, y, active) {
+    cursorDiv.style.left = x + 'px';
+    cursorDiv.style.top  = y + 'px';
+    cursorDiv.style.opacity = '1';
+    cursorDiv.style.background = active ? penColor + '44' : 'transparent';
+    cursorDiv.style.borderColor = penColor;
+    cursorDiv.style.boxShadow = `0 0 ${active?14:8}px ${penColor}, 0 0 ${active?28:16}px ${penColor}`;
+  }
+
+  function updateCursorColor() {
+    cursorDiv.style.borderColor = penColor;
+    cursorDiv.style.boxShadow = `0 0 10px ${penColor}, 0 0 20px ${penColor}`;
+  }
+
+  // ════════════════════════════════════════════════
+  //  MEDIAPIPE
+  // ════════════════════════════════════════════════
+  const videoEl    = document.getElementById('input-video');
+  const overlayCvs = document.getElementById('hand-overlay');
+  const overlayCtx = overlayCvs.getContext('2d');
+  const statusEl   = document.getElementById('status');
+  const loadingEl  = document.getElementById('loading');
+
+  // 平滑：对食指tip位置做低通滤波
+  let smoothTipX = null, smoothTipY = null;
+  const SMOOTH = 0.45;
+
+  const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.55,
+    minTrackingConfidence: 0.50
+  });
+
+  hands.onResults(results => {
+    // 2D 骨架覆盖层
+    overlayCvs.width  = videoEl.videoWidth  || 640;
+    overlayCvs.height = videoEl.videoHeight || 480;
+    overlayCtx.clearRect(0, 0, overlayCvs.width, overlayCvs.height);
+
+    if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+      liftPen();
+      cursorDiv.style.opacity = '0';
+      statusEl.textContent = '未检测到手…';
+      smoothTipX = null; smoothTipY = null;
+      return;
+    }
+
+    const lm = results.multiHandLandmarks[0];
+
+    // 画2D骨架
+    drawConnectors(overlayCtx, lm, HAND_CONNECTIONS,
+      { color: 'rgba(100,200,255,0.6)', lineWidth: 1.5 });
+    drawLandmarks(overlayCtx, lm,
+      { color: '#44aaff', lineWidth: 1, radius: 2 });
+
+    // 食指tip (landmark 8)
+    // MediaPipe x在[0,1]，已被视频mirrored（transform:scaleX(-1)），
+    // 所以我们需要将x镜像到屏幕坐标
+    const tip = lm[8];
+    // 镜像: screenX = (1 - tip.x) * W
+    const sx = (1 - tip.x) * window.innerWidth;
+    const sy = tip.y * window.innerHeight;
+
+    // 低通平滑
+    if (smoothTipX === null) { smoothTipX = sx; smoothTipY = sy; }
+    smoothTipX = smoothTipX + (sx - smoothTipX) * SMOOTH;
+    smoothTipY = smoothTipY + (sy - smoothTipY) * SMOOTH;
+
+    const gesture = classifyGesture(lm);
+
+    if (gesture === 'write') {
+      statusEl.textContent = '☝️ 书写中…';
+      updateCursor(smoothTipX, smoothTipY, true);
+
+      if (!isDrawing) {
+        // 刚落笔：点一个小圆
+        isDrawing = true;
+        drawDot(smoothTipX, smoothTipY);
+        prevX = smoothTipX; prevY = smoothTipY;
+      } else {
+        drawStroke(smoothTipX, smoothTipY);
+      }
+    } else if (gesture === 'pause') {
+      statusEl.textContent = gesture === 'pause' ? '✊ 抬笔' : '✌️ 抬笔';
+      liftPen();
+      updateCursor(smoothTipX, smoothTipY, false);
+    } else {
+      statusEl.textContent = '✋ 识别中…';
+      liftPen();
+      updateCursor(smoothTipX, smoothTipY, false);
+    }
+  });
+
+  const mpCamera = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width: 640, height: 480
+  });
+
+  mpCamera.start().then(() => {
+    loadingEl.style.display = 'none';
+  }).catch(e => {
+    loadingEl.textContent = '⚠️ 摄像头权限被拒绝';
+  });
+
+  // ════════════════════════════════════════════════
+  //  TOOLBAR INTERACTIONS
+  // ════════════════════════════════════════════════
+  const colorPicker = document.getElementById('color-picker');
+
+  document.getElementById('btn-color').addEventListener('click', () => {
+    colorPicker.classList.toggle('show');
+  });
+
+  document.querySelectorAll('.color-dot').forEach(dot => {
+    dot.addEventListener('click', () => {
+      document.querySelectorAll('.color-dot').forEach(d => d.classList.remove('active'));
+      dot.classList.add('active');
+      penColor = dot.dataset.color;
+      updateCursorColor();
+      colorPicker.classList.remove('show');
+    });
+  });
+
+  document.getElementById('btn-size').addEventListener('click', () => {
+    penSizeIdx = (penSizeIdx + 1) % penSizes.length;
+    penSize = penSizes[penSizeIdx];
+    const labels = ['细', '中', '粗', '超粗'];
+    document.getElementById('btn-size').textContent = `🖊 ${labels[penSizeIdx]}`;
+  });
+
+  document.getElementById('btn-clear').addEventListener('click', () => {
+    ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+    ctx.fillStyle = '#07080f';
+    ctx.fillRect(0, 0, drawCanvas.width, drawCanvas.height);
+    liftPen();
+  });
+
+  // 点击屏幕其他地方关闭颜色选择
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#color-picker') && !e.target.closest('#btn-color')) {
+      colorPicker.classList.remove('show');
+    }
+  });
+  </script>
+</body>
+</html>

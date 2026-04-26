@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>3D Hand Model</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#0a0a12; overflow:hidden; font-family:'Segoe UI',sans-serif; }
+
+    #three-canvas {
+      position:fixed; top:0; left:0; width:100%; height:100%; z-index:1;
+    }
+
+    /* Camera feed — full left panel */
+    #cam-wrap {
+      position:fixed; bottom:20px; left:20px;
+      width:280px; height:210px; z-index:10;
+      border-radius:12px; overflow:hidden;
+      border:1.5px solid rgba(100,180,255,0.35);
+      box-shadow:0 0 20px rgba(60,140,255,0.2);
+    }
+    #input-video {
+      width:100%; height:100%; object-fit:cover;
+      transform:scaleX(-1);
+    }
+    #hand-canvas-2d {
+      position:absolute; top:0; left:0;
+      width:100%; height:100%;
+      transform:scaleX(-1);
+    }
+    #cam-label {
+      position:absolute; bottom:6px; left:50%;
+      transform:translateX(-50%);
+      color:rgba(150,210,255,0.8); font-size:11px;
+      background:rgba(0,0,0,0.45); padding:2px 8px; border-radius:20px;
+      pointer-events:none;
+    }
+
+    /* Info panel */
+    #info {
+      position:fixed; top:20px; left:20px;
+      color:rgba(180,220,255,0.9); font-size:13px;
+      z-index:20; pointer-events:none; line-height:2;
+    }
+    #info h1 {
+      font-size:18px; font-weight:600;
+      color:rgba(120,200,255,1);
+      margin-bottom:6px;
+    }
+
+    #status {
+      position:fixed; top:20px; right:20px;
+      font-size:14px; color:rgba(120,220,255,0.9);
+      background:rgba(10,20,50,0.6); padding:8px 14px;
+      border-radius:10px; border:1px solid rgba(80,160,255,0.25);
+      z-index:20; pointer-events:none;
+    }
+
+    #loading {
+      position:fixed; top:50%; left:50%;
+      transform:translate(-50%,-50%);
+      color:rgba(100,180,255,0.9); font-size:16px; z-index:30;
+    }
+
+    #hint {
+      position:fixed; bottom:20px; right:20px;
+      color:rgba(100,180,255,0.6); font-size:12px;
+      z-index:20; pointer-events:none; text-align:right; line-height:1.8;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="three-canvas"></canvas>
+
+  <div id="cam-wrap">
+    <video id="input-video" autoplay muted playsinline></video>
+    <canvas id="hand-canvas-2d"></canvas>
+    <div id="cam-label">摄像头</div>
+  </div>
+
+  <div id="info">
+    <h1>✋ 3D Hand Model</h1>
+    实时将手部关键点映射为三维骨架模型
+  </div>
+  <div id="status">等待检测…</div>
+  <div id="loading">⏳ 加载模型中…</div>
+  <div id="hint">
+    左键拖拽 旋转视角<br>
+    滚轮 缩放
+  </div>
+
+  <!-- Three.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- MediaPipe Hands (CDN全局变量) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <script>
+  // ════════════════════════════════════════════════
+  //  THREE.JS SCENE
+  // ════════════════════════════════════════════════
+  const canvas3 = document.getElementById('three-canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas: canvas3, antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x0a0a12);
+  renderer.shadowMap.enabled = true;
+
+  const scene = new THREE.Scene();
+
+  // Subtle grid floor
+  const gridHelper = new THREE.GridHelper(10, 20, 0x1a2a4a, 0x0d1520);
+  gridHelper.position.y = -2.5;
+  scene.add(gridHelper);
+
+  // Ambient + directional light
+  scene.add(new THREE.AmbientLight(0x223355, 0.8));
+  const dirLight = new THREE.DirectionalLight(0x88ccff, 1.0);
+  dirLight.position.set(3, 5, 3);
+  scene.add(dirLight);
+
+  // Point light for glow effect
+  const pointLight = new THREE.PointLight(0x4488ff, 1.5, 15);
+  pointLight.position.set(0, 1, 2);
+  scene.add(pointLight);
+
+  // Camera
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.01, 200);
+  camera.position.set(0, 1, 6);
+  camera.lookAt(0, 0, 0);
+
+  // ── Orbit controls (manual) ──────────────────
+  let isDragging = false;
+  let prevMouse = { x: 0, y: 0 };
+  let orbitTheta = 0, orbitPhi = 0.3, orbitR = 6;
+
+  function applyOrbit() {
+    camera.position.set(
+      orbitR * Math.sin(orbitTheta) * Math.cos(orbitPhi),
+      orbitR * Math.sin(orbitPhi) + 0.5,
+      orbitR * Math.cos(orbitTheta) * Math.cos(orbitPhi)
+    );
+    camera.lookAt(0, 0.5, 0);
+  }
+
+  canvas3.addEventListener('mousedown', e => { isDragging = true; prevMouse = { x: e.clientX, y: e.clientY }; });
+  canvas3.addEventListener('mouseup',   () => { isDragging = false; });
+  canvas3.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    orbitTheta -= (e.clientX - prevMouse.x) * 0.008;
+    orbitPhi    = Math.max(-1.2, Math.min(1.2, orbitPhi + (e.clientY - prevMouse.y) * 0.006));
+    prevMouse = { x: e.clientX, y: e.clientY };
+    applyOrbit();
+  });
+  canvas3.addEventListener('wheel', e => {
+    orbitR = Math.max(1.5, Math.min(16, orbitR + e.deltaY * 0.01));
+    applyOrbit();
+  });
+  applyOrbit();
+
+  // ════════════════════════════════════════════════
+  //  HAND MODEL BUILDER
+  // ════════════════════════════════════════════════
+  // MediaPipe 21 landmark连接骨骼 (骨骼索引对)
+  const BONES = [
+    // 手腕 → 掌指关节
+    [0,1],[0,5],[0,9],[0,13],[0,17],
+    // 拇指
+    [1,2],[2,3],[3,4],
+    // 食指
+    [5,6],[6,7],[7,8],
+    // 中指
+    [9,10],[10,11],[11,12],
+    // 无名指
+    [13,14],[14,15],[15,16],
+    // 小指
+    [17,18],[18,19],[19,20],
+    // 掌心横向连接
+    [5,9],[9,13],[13,17]
+  ];
+
+  // 关节颜色映射（按手指分组）
+  const JOINT_COLORS = [
+    0xffffff, // 0 wrist
+    0xffaa00, // 1 thumb MCP
+    0xffcc00, // 2 thumb IP
+    0xffee44, // 3 thumb DIP
+    0xffff88, // 4 thumb tip
+    0x00ccff, // 5 index MCP
+    0x22ddff, // 6
+    0x66eeff, // 7
+    0x99ffff, // 8 index tip
+    0x00ff88, // 9 middle MCP
+    0x22ff99, // 10
+    0x66ffbb, // 11
+    0x99ffdd, // 12 middle tip
+    0xff44ff, // 13 ring MCP
+    0xff66ff, // 14
+    0xff88ff, // 15
+    0xffaaff, // 16 ring tip
+    0xff6633, // 17 pinky MCP
+    0xff8855, // 18
+    0xffaa77, // 19
+    0xffcc99, // 20 pinky tip
+  ];
+
+  // Joint sizes (tip joints slightly larger for glow)
+  const JOINT_SIZES = [
+    0.055, // wrist
+    0.040,0.038,0.036,0.050, // thumb
+    0.040,0.035,0.033,0.048, // index
+    0.040,0.035,0.033,0.048, // middle
+    0.038,0.033,0.030,0.045, // ring
+    0.036,0.030,0.028,0.042, // pinky
+  ];
+
+  // Materials cache
+  const jointMaterials = JOINT_COLORS.map((c, i) => {
+    const isTip = [4,8,12,16,20].includes(i);
+    return new THREE.MeshStandardMaterial({
+      color: c,
+      emissive: c,
+      emissiveIntensity: isTip ? 1.2 : 0.6,
+      roughness: 0.3,
+      metalness: 0.4,
+      transparent: true,
+      opacity: 0.95
+    });
+  });
+
+  const boneMat = new THREE.MeshStandardMaterial({
+    color: 0x4488ff,
+    emissive: 0x2255cc,
+    emissiveIntensity: 0.7,
+    roughness: 0.4,
+    metalness: 0.5,
+    transparent: true,
+    opacity: 0.75
+  });
+
+  // Reusable geometries
+  const sphereGeo = new THREE.SphereGeometry(1, 12, 10); // scaled per joint
+  const cylGeo    = new THREE.CylinderGeometry(1, 1, 1, 8, 1);
+
+  // Hand group
+  const handGroup = new THREE.Group();
+  scene.add(handGroup);
+
+  // Joint spheres (21)
+  const jointMeshes = [];
+  for (let i = 0; i < 21; i++) {
+    const mesh = new THREE.Mesh(sphereGeo, jointMaterials[i]);
+    const s = JOINT_SIZES[i];
+    mesh.scale.set(s, s, s);
+    mesh.visible = false;
+    handGroup.add(mesh);
+    jointMeshes.push(mesh);
+  }
+
+  // Bone cylinders (BONES.length)
+  const boneMeshes = [];
+  for (let i = 0; i < BONES.length; i++) {
+    const mesh = new THREE.Mesh(cylGeo, boneMat.clone());
+    mesh.visible = false;
+    handGroup.add(mesh);
+    boneMeshes.push(mesh);
+  }
+
+  // ── Glow halo for each joint tip (additive sprite) ──
+  const spriteMat = new THREE.SpriteMaterial({
+    color: 0x88ccff,
+    transparent: true,
+    opacity: 0.18,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+  const glowSprites = [4,8,12,16,20].map(idx => {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({
+      color: JOINT_COLORS[idx],
+      transparent: true,
+      opacity: 0.22,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    }));
+    s.scale.set(0.3, 0.3, 0.3);
+    s.visible = false;
+    handGroup.add(s);
+    return { sprite: s, idx };
+  });
+
+  // ── Map MediaPipe 2D+Z → 3D world coords ──────
+  // MediaPipe x,y in [0,1] (normalized), z is relative depth
+  // We map to world space centered at origin, Y up
+  const HAND_SCALE = 3.5;   // overall hand size in world units
+  const HAND_X_OFFSET = 0;
+  const HAND_Y_OFFSET = 0;
+  const Z_SCALE = 2.5;      // depth exaggeration for 3D feel
+
+  function lmToWorld(lm) {
+    // MediaPipe: x=right→left(mirrored), y=top→bottom, z=depth(smaller=closer)
+    // We mirror x for natural "mirror" display, flip y so hand is upright
+    const x = -(lm.x - 0.5) * HAND_SCALE + HAND_X_OFFSET;
+    const y = -(lm.y - 0.5) * HAND_SCALE + HAND_Y_OFFSET + 0.5;
+    const z =  -lm.z * Z_SCALE;
+    return new THREE.Vector3(x, y, z);
+  }
+
+  // Update cylinder to connect two points
+  function updateBone(mesh, p1, p2) {
+    const dir = new THREE.Vector3().subVectors(p2, p1);
+    const len = dir.length();
+    if (len < 0.001) { mesh.visible = false; return; }
+    mesh.visible = true;
+
+    const mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+    mesh.position.copy(mid);
+
+    // Scale: radius based on bone length
+    const r = 0.018;
+    mesh.scale.set(r, len, r);
+
+    // Rotate to align Y axis with direction
+    mesh.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 1, 0),
+      dir.normalize()
+    );
+  }
+
+  // ── Current hand world positions ──────────────
+  let handVisible = false;
+  const worldPositions = Array(21).fill(null).map(() => new THREE.Vector3());
+  // Smooth: lerp toward target
+  const smoothPositions = Array(21).fill(null).map(() => new THREE.Vector3());
+  const LERP_FACTOR = 0.35;
+
+  function updateHandModel(landmarks) {
+    handVisible = true;
+
+    // Compute world positions
+    for (let i = 0; i < 21; i++) {
+      worldPositions[i].copy(lmToWorld(landmarks[i]));
+    }
+
+    // Smooth
+    for (let i = 0; i < 21; i++) {
+      smoothPositions[i].lerp(worldPositions[i], LERP_FACTOR);
+    }
+
+    // Update joint spheres
+    for (let i = 0; i < 21; i++) {
+      jointMeshes[i].position.copy(smoothPositions[i]);
+      jointMeshes[i].visible = true;
+    }
+
+    // Update bones
+    for (let i = 0; i < BONES.length; i++) {
+      const [a, b] = BONES[i];
+      updateBone(boneMeshes[i], smoothPositions[a], smoothPositions[b]);
+    }
+
+    // Update glow sprites
+    glowSprites.forEach(({ sprite, idx }) => {
+      sprite.position.copy(smoothPositions[idx]);
+      sprite.visible = true;
+    });
+  }
+
+  function hideHand() {
+    handVisible = false;
+    jointMeshes.forEach(m => m.visible = false);
+    boneMeshes.forEach(m => m.visible = false);
+    glowSprites.forEach(({ sprite }) => sprite.visible = false);
+  }
+
+  // ════════════════════════════════════════════════
+  //  MEDIAPIPE
+  // ════════════════════════════════════════════════
+  const videoEl   = document.getElementById('input-video');
+  const handCvs2d = document.getElementById('hand-canvas-2d');
+  const handCtx2d = handCvs2d.getContext('2d');
+  const statusEl  = document.getElementById('status');
+  const loadingEl = document.getElementById('loading');
+
+  const hands = new Hands({
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.55,
+    minTrackingConfidence: 0.50
+  });
+
+  // Track multi-hand: render first hand in 3D, draw all in 2D overlay
+  let handCount = 0;
+  hands.onResults((results) => {
+    // 2D overlay drawing
+    handCvs2d.width  = videoEl.videoWidth  || 640;
+    handCvs2d.height = videoEl.videoHeight || 480;
+    handCtx2d.clearRect(0, 0, handCvs2d.width, handCvs2d.height);
+
+    handCount = results.multiHandLandmarks ? results.multiHandLandmarks.length : 0;
+
+    if (handCount > 0) {
+      // Draw 2D skeletons for all detected hands
+      results.multiHandLandmarks.forEach((lm, hi) => {
+        const color = hi === 0 ? 'rgba(100,200,255,0.8)' : 'rgba(100,255,160,0.8)';
+        drawConnectors(handCtx2d, lm, HAND_CONNECTIONS,
+          { color, lineWidth: 1.5 });
+        drawLandmarks(handCtx2d, lm,
+          { color: hi === 0 ? '#44aaff' : '#44ffaa', lineWidth: 1, radius: 2.5 });
+      });
+
+      // 3D model from first hand
+      updateHandModel(results.multiHandLandmarks[0]);
+
+      const labels = results.multiHandedness
+        ? results.multiHandedness.map(h => h.label).join(' + ')
+        : '手部';
+      statusEl.textContent = `✋ 检测到 ${handCount} 只手 (${labels})`;
+    } else {
+      hideHand();
+      statusEl.textContent = '未检测到手部…';
+    }
+  });
+
+  const mpCamera = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width: 640, height: 480
+  });
+
+  mpCamera.start().then(() => {
+    loadingEl.style.display = 'none';
+  }).catch(e => {
+    loadingEl.textContent = '⚠️ 摄像头权限被拒绝';
+    console.warn(e);
+  });
+
+  // ════════════════════════════════════════════════
+  //  PARTICLE BACKGROUND
+  // ════════════════════════════════════════════════
+  function buildBgParticles() {
+    const pos = [];
+    for (let i = 0; i < 3000; i++) {
+      pos.push((Math.random()-0.5)*40, (Math.random()-0.5)*40, (Math.random()-0.5)*40);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    return new THREE.Points(geo, new THREE.PointsMaterial({
+      size: 0.04, color: 0x334466,
+      transparent: true, opacity: 0.6, sizeAttenuation: true
+    }));
+  }
+  scene.add(buildBgParticles());
+
+  // ════════════════════════════════════════════════
+  //  ANIMATION LOOP
+  // ════════════════════════════════════════════════
+  const clock = new THREE.Clock();
+  let t = 0;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    t += clock.getDelta();
+
+    // Pulse point light
+    pointLight.intensity = 1.5 + Math.sin(t * 2.5) * 0.4;
+
+    // Subtle float of hand group when visible
+    if (handVisible) {
+      handGroup.position.y = Math.sin(t * 1.2) * 0.02;
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // ── Resize ──────────────────────────────────────
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+  </script>
+</body>
+</html>
